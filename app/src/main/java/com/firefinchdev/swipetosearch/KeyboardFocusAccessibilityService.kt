@@ -8,6 +8,7 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.util.Log
+import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -54,7 +55,8 @@ class KeyboardFocusAccessibilityService : AccessibilityService() {
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
-                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                    AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
             // Filter events to only the launcher package — huge perf win
             packageNames = currentLauncherPackage?.let { arrayOf(it) }
         }
@@ -124,6 +126,74 @@ class KeyboardFocusAccessibilityService : AccessibilityService() {
         } finally {
             rootNode.recycle()
         }
+    }
+
+    override fun onKeyEvent(event: KeyEvent): Boolean {
+        if (!isServiceEnabledInApp || !isDrawerSessionActive) return false
+
+        val isEnterOrSearch = event.keyCode == KeyEvent.KEYCODE_ENTER ||
+                event.keyCode == KeyEvent.KEYCODE_SEARCH ||
+                event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+
+        if (isEnterOrSearch && event.action == KeyEvent.ACTION_UP) {
+            val handled = launchFirstSearchResult()
+            if (handled) return true
+        }
+        return false
+    }
+
+    /**
+     * Walks the accessibility tree of the active window to find the first
+     * clickable app-result node (list item / icon) and clicks it.
+     * Returns true if a node was found and clicked.
+     */
+    private fun launchFirstSearchResult(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        return try {
+            findFirstClickableResult(root)?.let { node ->
+                val clicked = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                node.recycle()
+                clicked
+            } ?: false
+        } catch (e: Exception) {
+            Log.e(TAG, "Error launching first search result", e)
+            false
+        } finally {
+            root.recycle()
+        }
+    }
+
+    /**
+     * BFS through the tree to find the first node that is:
+     *  - clickable
+     *  - not the search field itself (we skip the search_src_text node)
+     *  - not a keyboard / IME node
+     */
+    private fun findFirstClickableResult(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val viewId = node.viewIdResourceName ?: ""
+
+            // Skip the search bar itself
+            if (viewId.endsWith(TARGET_ID_NAME)) {
+                node.recycle()
+                continue
+            }
+
+            if (node.isClickable && node.isVisibleToUser) {
+                // Return a fresh reference — caller must recycle
+                return AccessibilityNodeInfo.obtain(node).also { node.recycle() }
+            }
+
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+            node.recycle()
+        }
+        return null
     }
 
     override fun onInterrupt() {
